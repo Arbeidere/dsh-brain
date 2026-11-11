@@ -1,0 +1,5 @@
+- insert:
+    - id: dsh-brain
+      name: 'dsh-brain'
+      config:
+        dbPath: 'D:\dsh-output\tools\dsh-brain\brain.db'
