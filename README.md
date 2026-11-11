@@ -174,6 +174,11 @@ node test/peek.mjs    # 直接查看线上库
 - 注入的消息与主流插件同构：优先用 `@deepseek-ai/dsh-llm` 的 `createUserMessage`，
   解析不到就用同形状的冻结消息兜底，注入永远不会把插件弄挂。
 
-## License
+## License / 许可
 
-MIT
+MIT —— 可自由使用、修改、分发，保留版权声明即可。
+
+- English: released under the [MIT License](LICENSE). Use it, change it, ship it — just keep the copyright notice.
+- 中文：以 [MIT 协议](LICENSE) 发布。随便用、随便改、随便发，留个版权声明就行。
+
+> 注：`LICENSE` 是英文协议原文；这行中文只是方便阅读，不构成额外条款。
