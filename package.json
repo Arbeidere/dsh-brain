@@ -1,18 +1,10 @@
 {
-  "name": "dsh-brain",
-  "version": "0.2.0",
-  "description": "Brain-inspired shared memory for DeepSeek Harness: hippocampus / prefrontal cortex / cortex, forgetting curves, sleep consolidation and spontaneous flashbacks.",
+  "name": "@local/dsh-brain",
+  "version": "0.1.2",
+  "private": true,
+  "description": "Brain-inspired shared memory for DeepSeek Harness: hippocampus / prefrontal cortex / cortex regions, forgetting curves, sleep consolidation.",
   "type": "module",
   "license": "MIT",
-  "keywords": [
-    "dsh",
-    "deepseek-harness",
-    "memory",
-    "agent",
-    "hippocampus",
-    "forgetting-curve",
-    "sqlite"
-  ],
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
@@ -23,15 +15,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md",
-    "LICENSE"
+    "README.md"
   ],
-  "scripts": {
-    "test": "node test/test.mjs && node test/test2.mjs && node test/test3.mjs && node test/test4.mjs && node test/test5.mjs"
-  },
-  "engines": {
-    "node": ">=22.5"
-  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
