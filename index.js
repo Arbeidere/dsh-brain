@@ -20,6 +20,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, appendFileSync, statSync, writeFileSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { homedir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
@@ -99,9 +100,24 @@ const SYN = {
   'c:失败': ['c:报错', 'w:error'],
 }
 
+// 双向闭合：搜「file」也要能命中「文件」，否则同义词只单向通
+for (const [word, list] of Object.entries(SYN)) {
+  for (const alias of list) {
+    if (!SYN[alias]) SYN[alias] = []
+    if (!SYN[alias].includes(word)) SYN[alias].push(word)
+  }
+}
+
+function defaultDbPath() {
+  try {
+    if (existsSync('D:\\dsh-output')) return 'D:\\dsh-output\\tools\\dsh-brain\\brain.db'
+  } catch { /* 没有 D 盘就走下面 */ }
+  return join(homedir(), '.dsh', 'dsh-brain', 'brain.db')
+}
+
 const DEFAULTS = {
-  /** 全池共用的脑库 */
-  dbPath: 'D:\\dsh-output\\tools\\dsh-brain\\brain.db',
+  /** 全池共用的脑库（D 盘不存在时自动退回 ~/.dsh/dsh-brain/brain.db） */
+  dbPath: defaultDbPath(),
   /** 每回合结束自动写一条情景记忆 */
   capture: true,
   /** 每回合第一步自动唤起相关记忆并注入上下文 */
@@ -125,7 +141,6 @@ const DEFAULTS = {
 /** 包含这些词的记忆会被判为更重要 */
 const HEAT = /(决定|改成|改到|以后|记住|记得|偏好|结论|必须|一定|别用|不要|只能|统一|硬约束|规定|always|never|must|decided|decide|prefer|remember|final)/i
 
-let SLEEP_INTERVAL_MS = DEFAULTS.sleepEveryHours * 3600000
 const POOL = new Map()
 let dshLlmModule
 
@@ -155,6 +170,8 @@ function openDb(dbPath, log) {
     mkdirSync(dirname(dbPath), { recursive: true })
     const db = new DatabaseSync(dbPath)
     db.exec('PRAGMA journal_mode = WAL')
+    // 四个工作池共用一个库：别人在写的时候等一会儿，而不是直接抛 SQLITE_BUSY
+    db.exec('PRAGMA busy_timeout = 5000')
     db.exec('PRAGMA synchronous = NORMAL')
     db.exec(`CREATE TABLE IF NOT EXISTS engrams (
       id TEXT PRIMARY KEY,
@@ -260,35 +277,49 @@ const rekindle = (v, delta = 0.35) => clamp01(v + delta * (1 - v))
 
 /* ---------------------------------------------------------------- 读写记忆 */
 
+function withTx(db, fn) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const out = fn()
+    db.exec('COMMIT')
+    return out
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch { /* 回滚失败就算了 */ }
+    throw error
+  }
+}
+
 function writeEngram(db, row) {
   const id = row.id ?? randomUUID()
   const created = row.created_at ?? Date.now()
   const tokens = tokenize(row.text)
-  db.prepare(`INSERT INTO engrams
-    (id, text, kind, region, importance, v0, created_at, last_access, access_count, tokcount, scope, session_id, tags, source, state, hash, tone, fulfilled)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(
-      id,
-      row.text,
-      row.kind,
-      row.region,
-      clamp01(row.importance),
-      clamp01(row.v0),
-      created,
-      row.last_access ?? created,
-      row.access_count ?? 0,
-      tokens.length,
-      row.scope ?? null,
-      row.session_id ?? null,
-      JSON.stringify(row.tags ?? []),
-      row.source ?? 'manual',
-      row.state ?? 'active',
-      row.hash,
-      row.tone ?? null,
-      row.fulfilled ? 1 : 0,
-    )
-  const insTok = db.prepare('INSERT INTO tokens (engram_id, token) VALUES (?, ?)')
-  for (const t of tokens) insTok.run(id, t)
+  withTx(db, () => {
+    db.prepare(`INSERT INTO engrams
+      (id, text, kind, region, importance, v0, created_at, last_access, access_count, tokcount, scope, session_id, tags, source, state, hash, tone, fulfilled)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        id,
+        row.text,
+        row.kind,
+        row.region,
+        clamp01(row.importance),
+        clamp01(row.v0),
+        created,
+        row.last_access ?? created,
+        row.access_count ?? 0,
+        tokens.length,
+        row.scope ?? null,
+        row.session_id ?? null,
+        JSON.stringify(row.tags ?? []),
+        row.source ?? 'manual',
+        row.state ?? 'active',
+        row.hash,
+        row.tone ?? null,
+        row.fulfilled ? 1 : 0,
+      )
+    const insTok = db.prepare('INSERT INTO tokens (engram_id, token) VALUES (?, ?)')
+    for (const t of tokens) insTok.run(id, t)
+  })
   return id
 }
 
@@ -341,7 +372,8 @@ function recall(db, cfg, input) {
   // 查询词元：原词权重 1，同义/别名扩展词元权重 0.5
   const weights = new Map()
   for (const t of tokenize(query)) weights.set(t, 1)
-  for (const [t, w] of weights) {
+  // 只扩展一层：先拍快照，避免边遍历边 set 造成多跳扩散把权重越乘越小
+  for (const [t, w] of [...weights]) {
     for (const alias of SYN[t] ?? []) if (!weights.has(alias)) weights.set(alias, 0.5 * w)
   }
   const qTokens = [...weights.keys()]
@@ -376,9 +408,10 @@ function recall(db, cfg, input) {
     if (!includeDormant && v < THETA_DEMOTE) continue
     const matched = String(row.matched ?? '').split(',').filter(Boolean)
     const hitWeight = matched.reduce((sum, t) => sum + weightOf(t), 0)
+    // 分子是 IDF 加权和、分母是原始词数，量纲不一致 → 夹到 [0,1]，别让单个稀有词压过强度和重要性
     const similarity = fallback
       ? 0.5
-      : hitWeight / Math.sqrt(Math.max(1, queryWeight) * Math.max(1, Number(row.tokcount) || 1))
+      : clamp01(hitWeight / Math.sqrt(Math.max(1, queryWeight) * Math.max(1, Number(row.tokcount) || 1)))
     const score = 0.58 * similarity + 0.3 * v + 0.12 * clamp01(Number(row.importance))
     scored.push({ row, v, score, similarity })
   }
@@ -469,16 +502,19 @@ function forget(db, input) {
     const row = db.prepare('SELECT * FROM engrams WHERE id = ?').get(String(input.id))
     if (row) removed.push(row)
   }
+  // 按说法定位时只删「最相关的那一条」——除非显式给 all=true，避免一句话删掉五条不可恢复的记忆
   if (input.query && removed.length === 0) {
-    const hits = recall(db, DEFAULTS, { query: input.query, limit: 5, includeDormant: true })
+    const hits = recall(db, { ...DEFAULTS, warmth: false }, { query: input.query, limit: input.all ? 5 : 1, includeDormant: true })
     removed.push(...hits)
   }
-  const del = db.prepare('DELETE FROM engrams WHERE id = ?')
-  const delTok = db.prepare('DELETE FROM tokens WHERE engram_id = ?')
-  for (const row of removed) {
-    delTok.run(row.id)
-    del.run(row.id)
-  }
+  withTx(db, () => {
+    const del = db.prepare('DELETE FROM engrams WHERE id = ?')
+    const delTok = db.prepare('DELETE FROM tokens WHERE engram_id = ?')
+    for (const row of removed) {
+      delTok.run(row.id)
+      del.run(row.id)
+    }
+  })
   return { removed: removed.length, ids: removed.map((r) => r.id), reason: input.reason ?? null }
 }
 
@@ -498,67 +534,71 @@ function sleep(db, cfg, log) {
   const setState = db.prepare('UPDATE engrams SET state = ? WHERE id = ?')
   const setRegion = db.prepare('UPDATE engrams SET region = ?, kind = ? WHERE id = ?')
 
-  let demoted = 0
-  let promoted = 0
-  let fused = 0
-  let pruned = 0
+  const summary = withTx(db, () => {
+    let demoted = 0
+    let promoted = 0
+    let fused = 0
+    let pruned = 0
 
-  const hippocampus = []
-  for (const row of rows) {
-    const v = strengthOf(row)
-    const age = ageDays(row.created_at)
+    const hippocampus = []
+    for (const row of rows) {
+      const v = strengthOf(row)
+      const age = ageDays(row.created_at)
 
-    if (row.state === 'active') {
-      const weakEpi = row.region === 'hippocampus' && v < THETA_WEAK_EPISODIC && Number(row.access_count) === 0 && age > 2
-      if (v < THETA_DEMOTE || weakEpi) {
-        setState.run('dormant', row.id)
-        demoted += 1
+      if (row.state === 'active') {
+        const weakEpi = row.region === 'hippocampus' && v < THETA_WEAK_EPISODIC && Number(row.access_count) === 0 && age > 2
+        if (v < THETA_DEMOTE || weakEpi) {
+          setState.run('dormant', row.id)
+          demoted += 1
+          continue
+        }
+        if (row.region === 'hippocampus' && v >= THETA_PROMOTE && (Number(row.access_count) >= 3 || Number(row.importance) >= 0.8)) {
+          setRegion.run('cortex', 'semantic', row.id)
+          promoted += 1
+        }
+      }
+
+      if (row.state !== 'active' && row.last_access && (now - Number(row.last_access)) / DAY > PRUNE_DAYS) {
+        db.prepare('DELETE FROM tokens WHERE engram_id = ?').run(row.id)
+        db.prepare('DELETE FROM engrams WHERE id = ?').run(row.id)
+        pruned += 1
         continue
       }
-      if (row.region === 'hippocampus' && v >= THETA_PROMOTE && (Number(row.access_count) >= 3 || Number(row.importance) >= 0.8)) {
-        setRegion.run('cortex', 'semantic', row.id)
-        promoted += 1
+
+      if (row.region === 'hippocampus' && row.state === 'active') hippocampus.push(row)
+    }
+
+    // 海马体：把说得几乎一样的两条情景记忆融成一条（保留强的）
+    const recent = hippocampus.sort((a, b) => b.created_at - a.created_at).slice(0, 200)
+    const sets = new Map(recent.map((r) => [r.id, new Set(tokensOf.all(r.id).map((x) => x.token))]))
+    const dead = new Set()
+    for (let i = 0; i < recent.length; i += 1) {
+      if (dead.has(recent[i].id)) continue
+      for (let j = i + 1; j < recent.length; j += 1) {
+        if (dead.has(recent[j].id)) continue
+        const sim = jaccard(sets.get(recent[i].id), sets.get(recent[j].id))
+        if (sim >= THETA_FUSE) {
+          const weaker = strengthOf(recent[i]) >= strengthOf(recent[j]) ? recent[j] : recent[i]
+          setState.run('fused', weaker.id)
+          dead.add(weaker.id)
+          fused += 1
+        }
       }
     }
 
-    if (row.state !== 'active' && row.last_access && (now - Number(row.last_access)) / DAY > PRUNE_DAYS) {
-      db.prepare('DELETE FROM tokens WHERE engram_id = ?').run(row.id)
-      db.prepare('DELETE FROM engrams WHERE id = ?').run(row.id)
-      pruned += 1
-      continue
-    }
-
-    if (row.region === 'hippocampus' && row.state === 'active') hippocampus.push(row)
-  }
-
-  // 海马体：把说得几乎一样的两条情景记忆融成一条（保留强的）
-  const recent = hippocampus.sort((a, b) => b.created_at - a.created_at).slice(0, 200)
-  const sets = new Map(recent.map((r) => [r.id, new Set(tokensOf.all(r.id).map((x) => x.token))]))
-  const dead = new Set()
-  for (let i = 0; i < recent.length; i += 1) {
-    if (dead.has(recent[i].id)) continue
-    for (let j = i + 1; j < recent.length; j += 1) {
-      if (dead.has(recent[j].id)) continue
-      const sim = jaccard(sets.get(recent[i].id), sets.get(recent[j].id))
-      if (sim >= THETA_FUSE) {
-        const weaker = strengthOf(recent[i]) >= strengthOf(recent[j]) ? recent[j] : recent[i]
-        setState.run('fused', weaker.id)
-        dead.add(weaker.id)
-        fused += 1
-      }
-    }
-  }
-
-  metaSet(db, 'last_sleep', now)
-  const summary = { demoted, promoted, fused, pruned, total: rows.length }
-  debugLog(cfg, `sleep: demoted=${demoted} promoted=${promoted} fused=${fused} pruned=${pruned}`)
+    metaSet(db, 'last_sleep', now)
+    return { demoted, promoted, fused, pruned, total: rows.length }
+  })
+  debugLog(cfg, `sleep: demoted=${summary.demoted} promoted=${summary.promoted} fused=${summary.fused} pruned=${summary.pruned}`)
   log?.debug?.(`[brain] 睡眠整理 ${JSON.stringify(summary)}`)
   return summary
 }
 
 function maybeSleep(db, cfg, log) {
   const last = Number(metaGet(db, 'last_sleep') ?? 0)
-  if (Date.now() - last < SLEEP_INTERVAL_MS) return null
+  // 用 cfg 里的值算间隔，别用模块级全局——多实例/多 profile 会互相覆盖
+  const hours = Math.max(1, Number(cfg?.sleepEveryHours ?? DEFAULTS.sleepEveryHours))
+  if (Date.now() - last < hours * 3600000) return null
   return sleep(db, cfg, log)
 }
 
@@ -587,6 +627,8 @@ function timeSense(db) {
 }
 
 function buildPriming(db, cfg, scope, cue, context = {}) {
+  // 每回合的自动唤起也是一次"想起"，顺手做掉睡醒超过阈值的整理
+  try { maybeSleep(db, cfg) } catch { /* 整理失败不该影响注入 */ }
   const rows = db.prepare("SELECT * FROM engrams WHERE state = 'active'").all()
   const withV = rows.map((row) => ({ row, v: strengthOf(row) })).filter((x) => x.v >= 0.2 || x.row.region === 'pfc')
 
@@ -655,9 +697,18 @@ function buildPriming(db, cfg, scope, cue, context = {}) {
 
   if (lines.length === 0) return null
 
-  const body = `【长期记忆 · 自动唤起】\n${lines.join('\n')}\n\n` +
-    '需要更多细节就调 brain_recall（说清楚想找什么）；有值得长期留住的结论/偏好，用 brain_remember 写下来。'
-  return body.slice(0, cfg.primeMaxChars)
+  const hint = '需要更多细节就调 brain_recall（说清楚想找什么）；有值得长期留住的结论/偏好，用 brain_remember 写下来。'
+  const head = '【长期记忆 · 自动唤起】\n'
+  const budget = Math.max(200, Number(cfg.primeMaxChars ?? 900) - hint.length - head.length - 4)
+  let rest = lines.join('\n')
+  if (rest.length > budget) {
+    // 按行裁剪，尽量不在半句话上切断
+    rest = rest.slice(0, budget)
+    const cut = rest.lastIndexOf('\n')
+    if (cut > budget * 0.6) rest = rest.slice(0, cut)
+    rest = `${rest}…`
+  }
+  return `${head}${rest}\n\n${hint}`
 }
 
 const short = (text, n) => (text.length > n ? `${text.slice(0, n)}…` : text)
@@ -1185,7 +1236,8 @@ function makeTools(db, cfg) {
         type: 'object',
         properties: {
           id: { type: 'string', description: '要删的记忆 id（brain_recall 返回里有）' },
-          query: { type: 'string', description: '没有 id 时用说法来定位，会删掉最相关的一条' },
+          query: { type: 'string', description: '没有 id 时用说法来定位，默认只删最相关的那一条' },
+          all: { type: 'boolean', description: '配合 query：true 时把最相关的 5 条一起删（默认 false，只删一条）' },
           reason: { type: 'string', description: '为什么忘掉它' },
         },
         additionalProperties: false,
@@ -1196,7 +1248,7 @@ function makeTools(db, cfg) {
           properties: {
             removed: { type: 'number' },
             ids: { type: 'array', items: { type: 'string' } },
-            reason: { type: ['string', 'null'] },
+            reason: { type: 'string' },
           },
           required: ['removed', 'ids'],
         },
@@ -1228,7 +1280,7 @@ function makeTools(db, cfg) {
       output: {
         schema: {
           type: 'object',
-          properties: { ok: { type: 'boolean' }, id: { type: ['string', 'null'] }, text: { type: ['string', 'null'] } },
+          properties: { ok: { type: 'boolean' }, id: { type: 'string' }, text: { type: 'string' } },
           required: ['ok', 'id'],
         },
         render: (_args, value) => [
@@ -1322,7 +1374,6 @@ export function apply(ctx, config) {
   const log = ctx?.logger
   debugLog(cfg, `apply: start prime=${cfg.prime} capture=${cfg.capture}`)
   const db = openDb(cfg.dbPath, log)
-  SLEEP_INTERVAL_MS = Math.max(1, Number(cfg.sleepEveryHours ?? 12)) * 3600000
 
   ctx.effect(() => {
     if (!db) return () => {}
